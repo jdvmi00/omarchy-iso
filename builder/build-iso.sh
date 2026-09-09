@@ -480,6 +480,16 @@ if [[ $OMARCHY_ARCH == "aarch64" ]]; then
   echo "aarch64: excluded $((before - ${#all_packages[@]})) x86-only packages from the offline mirror"
 fi
 
+# Arch dropped the prebuilt broadcom-wl on 2026-09-02 and rebuilt broadcom-wl-dkms
+# with replaces=(broadcom-wl). A replaces entry only helps upgrades of an already
+# installed package; as an explicit pacman target the old name now fails with
+# "target not found". Published Omarchy runtime packages that predate the rename
+# still list it in omarchy-other.packages, so map it here until every channel
+# ships a runtime that names broadcom-wl-dkms itself.
+mapfile -t all_packages < <(
+  printf '%s\n' "${all_packages[@]}" | sed 's/^broadcom-wl$/broadcom-wl-dkms/' | sort -u
+)
+
 # With --local-source we already built these omarchy* packages directly into
 # the mirror; strip them from the pacman -Syw list so it doesn't try to fetch
 # the published versions on top.
