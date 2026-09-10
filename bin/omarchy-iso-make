@@ -51,6 +51,15 @@ while [[ $# -gt 0 ]]; do
     OMARCHY_ISO_REF=local
     shift 3
     ;;
+  --prebuilt-packages)
+    PREBUILT_PKGS_PATH="${2:-}"
+    if [[ -z $PREBUILT_PKGS_PATH || ! -d $PREBUILT_PKGS_PATH ]]; then
+      echo "Error: --prebuilt-packages requires a directory of *.pkg.tar.* files" >&2
+      exit 1
+    fi
+    PREBUILT_PKGS_PATH=$(cd "$PREBUILT_PKGS_PATH" && pwd)
+    shift 2
+    ;;
   --dev)
     OMARCHY_ISO_REF=dev
     OMARCHY_MIRROR=edge
@@ -68,7 +77,7 @@ while [[ $# -gt 0 ]]; do
     ;;
   *)
     echo "Unknown option: $1"
-    echo "Usage: $0 [--arch x86_64|aarch64] [--no-cache] [--keep-pkg-cache] [--no-boot-offer] [--debug] [--edge] [--dev|--rc] [--local-source <omarchy-checkout> <pkgs-checkout>]"
+    echo "Usage: $0 [--arch x86_64|aarch64] [--no-cache] [--keep-pkg-cache] [--no-boot-offer] [--debug] [--edge] [--dev|--rc] [--prebuilt-packages <dir>] [--local-source <omarchy-checkout> <pkgs-checkout>]"
     exit 1
     ;;
   esac
@@ -172,6 +181,12 @@ if [[ -n $LOCAL_OMARCHY_PATH ]]; then
     -v "$LOCAL_OMARCHY_PATH:/omarchy-source:ro"
     -v "$LOCAL_PKGS_PATH:/omarchy-pkgs:ro"
   )
+fi
+
+# Prebuilt packages (for example a locally built kernel) are copied into the
+# offline mirror as-is and replace the published versions of the same names.
+if [[ -n ${PREBUILT_PKGS_PATH:-} ]]; then
+  DOCKER_ARGS+=(-v "$PREBUILT_PKGS_PATH:/prebuilt:ro")
 fi
 
 if [[ -d /var/cache/pacman/pkg ]]; then

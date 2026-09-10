@@ -106,6 +106,31 @@
         "nvidia-utils",
         "nvidia-container-toolkit"
       ]
+    },
+    {
+      "id": "microsoft-surface-laptop8",
+      "name": "Microsoft Surface Laptop 8 (13.8in, Snapdragon X2 Elite)",
+      "match": [
+        {
+          "sys_vendor": "Microsoft Corporation",
+          "product_name": "Surface Laptop 13.8in 8th Ed Snapdragon"
+        }
+      ],
+      "boot": {
+        "hardware_description": "dtb-override",
+        "dtb": "qcom/glymur-microsoft-surface-laptop8.dtb",
+        "kernel_cmdline": [
+          "console=tty0",
+          "plymouth.ignore-serial-consoles"
+        ]
+      },
+      "kernel": {
+        "package": "linux-aarch64",
+        "availability": "iso"
+      },
+      "packages": [
+        "linux-firmware"
+      ]
     }
   ]
 }

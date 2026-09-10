@@ -319,6 +319,26 @@ if [[ -d /omarchy-source && -d /omarchy-pkgs ]]; then
   LOCAL_OMARCHY_BUILD=1
 fi
 
+# Prebuilt packages supplied by the host (--prebuilt-packages) go into the
+# offline mirror as-is. Their names are stripped from the pacman -Syw list so
+# the published versions are not fetched on top, and their files are kept
+# through the prune below. Used for a kernel built outside this ISO build.
+prebuilt_names=()
+prebuilt_files=()
+if [[ -d /prebuilt ]]; then
+  shopt -s nullglob
+  for prebuilt in /prebuilt/*.pkg.tar.*; do
+    [[ $prebuilt == *.sig ]] && continue
+    read -r prebuilt_name _ < <(pacman -Qp "$prebuilt") ||
+      { echo "ERROR: cannot read package name from $prebuilt" >&2; exit 1; }
+    cp -f "$prebuilt" "$offline_mirror_dir/"
+    prebuilt_names+=("$prebuilt_name")
+    prebuilt_files+=("${prebuilt##*/}")
+    echo "Prebuilt package: $prebuilt_name (${prebuilt##*/})"
+  done
+  shopt -u nullglob
+fi
+
 # Node.js binary for offline mise install.
 if [[ $OMARCHY_ARCH == "aarch64" ]]; then
   NODE_TARBALL_SUFFIX="linux-arm64.tar.gz"
@@ -508,6 +528,12 @@ if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
   )
 fi
 
+if (( ${#prebuilt_names[@]} )); then
+  mapfile -t all_packages < <(
+    printf '%s\n' "${all_packages[@]}" | grep -Fxv "${prebuilt_names[@]/#/-e}" || true
+  )
+fi
+
 mkdir -p /tmp/offlinedb
 download_offline_packages() {
   pacman --config "$pacman_online_conf" --noconfirm -Syw \
@@ -564,6 +590,10 @@ if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
     fi
     required_package_files+=("$local_package_file")
   done
+fi
+
+if (( ${#prebuilt_files[@]} )); then
+  required_package_files+=("${prebuilt_files[@]}")
 fi
 
 printf '%s\n' "${required_package_files[@]}" |
