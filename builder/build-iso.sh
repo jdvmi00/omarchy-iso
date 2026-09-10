@@ -594,6 +594,29 @@ fi
 
 if (( ${#prebuilt_files[@]} )); then
   required_package_files+=("${prebuilt_files[@]}")
+  # pacman -Syw can still fetch the published build of a prebuilt package when
+  # something depends on it through a provider (linux-aarch64 provides linux).
+  # repo-add keeps whichever file it sees last, not the newest, so drop every
+  # other file carrying a prebuilt package's name before the mirror is indexed.
+  for prebuilt_name in "${prebuilt_names[@]}"; do
+    for candidate in "$offline_mirror_dir/$prebuilt_name-"*.pkg.tar.*; do
+      [[ -f $candidate && $candidate != *.sig ]] || continue
+      read -r candidate_name _ < <(pacman -Qp "$candidate" 2>/dev/null) || continue
+      [[ $candidate_name == "$prebuilt_name" ]] || continue
+      case " ${prebuilt_files[*]} " in
+        *" ${candidate##*/} "*) ;;
+        *)
+          echo "Dropping published $candidate_name in favour of the prebuilt one: ${candidate##*/}"
+          rm -f "$candidate" "$candidate.sig"
+          # It was on the keep-list from the -Syw resolution; take it off so
+          # the prune below does not look for a file that is now gone.
+          mapfile -t required_package_files < <(
+            printf '%s\n' "${required_package_files[@]}" | grep -Fxv -e "${candidate##*/}" || true
+          )
+          ;;
+      esac
+    done
+  done
 fi
 
 printf '%s\n' "${required_package_files[@]}" |
