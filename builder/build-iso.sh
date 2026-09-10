@@ -697,6 +697,16 @@ if [[ $OMARCHY_ARCH == "aarch64" ]]; then
       { echo "ERROR: $_dtb missing from $(basename "$kernel_pkg_file")" >&2; exit 1; }
   done
   echo "aarch64: staged ${#platform_dtbs[@]} platform device tree(s) from $(basename "$kernel_pkg_file")"
+
+  # Bring-up log add-on: a second initrd GRUB appends to the main one. Its
+  # mkinitcpio hook writes dmesg and driver state to the stick's ARCHISO_EFI
+  # partition every few seconds, for machines with no working display or
+  # keyboard. Staged into the same grub/ directory, so it lands at
+  # /boot/grub/surfacelog.cpio on ISO 9660 (see configs/aarch64/surfacelog/).
+  if [[ -f /configs/aarch64/surfacelog/surfacelog.cpio ]]; then
+    install -Dm644 /configs/aarch64/surfacelog/surfacelog.cpio "$build_cache_dir/grub/surfacelog.cpio"
+    echo "aarch64: staged the surfacelog initramfs add-on"
+  fi
 fi
 
 # mkarchiso expects the mirror at /var/cache/omarchy/mirror/offline inside the
