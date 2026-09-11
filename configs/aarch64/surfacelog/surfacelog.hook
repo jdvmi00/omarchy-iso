@@ -1,7 +1,5 @@
 #!/usr/bin/ash
-# surfacelog: write dmesg/state to the ARCHISO_EFI FAT partition every 3 s, before and
-# after switch_root (loop in /run/surfacelog-rt with relative paths + own busybox/ld.so
-# copies, since switch_root wipes the initramfs we stay rooted in). Never fails the boot.
+# surfacelog: boot logger to the ARCHISO_EFI FAT partition, survives switch_root. See README.md.
 
 _sl_rt=/run/surfacelog-rt
 _sl_mnt=/run/surfacelog
@@ -62,11 +60,10 @@ _sl_prepare_rt() {
 _sl_write_loop() {
     cat >"$_sl_rt/loop.sh" <<'EOF'
 #!/usr/bin/ash
-# surfacelog loop: loop.sh loop|show [DEV START REBOOT WDT]; cwd fixed, relative paths only
 mode="$1" dev="$2" start="${3:-0}" rb="${4:-0}" wdt="${5:-0}"
+ran=0
 cd /run/surfacelog-rt || exit 0
-ROOT=../.. MNT=../surfacelog NULL=./null LOGD='' round=0 d='' how='' found=''
-# watchdog first: opening arms it; a failed exec-redirect would kill the shell, so probe in a subshell
+ROOT=../.. MNT=../surfacelog NULL=./null DBG=../../sys/kernel/debug LOGD='' round=0 d='' how='' found='' p0=''
 if [ "$wdt" = 1 ] && [ -w "$ROOT/dev/watchdog" ] && ( exec 8>"$ROOT/dev/watchdog" ) 2>"$NULL"; then
     exec 8>"$ROOT/dev/watchdog"
 else
@@ -154,6 +151,25 @@ setup_dir() {
     log "created $LOGD (boot #$n), logging there"
     return 0
 }
+debugfs() { bb mountpoint -q "$DBG" 2>"$NULL" || do_mount -c -t debugfs none "$DBG" 2>"$NULL"; }
+dump() {
+    local f
+    debugfs
+    for f in clk/clk_summary:clk_summary regulator/regulator_summary:regulator_summary dri/0/state:drm_state pm_genpd/pm_genpd_summary:genpd interconnect/interconnect_summary:interconnect; do
+        bb cat "$DBG/${f%%:*}" >"$LOGD/${f#*:}.txt" 2>&1
+    done
+}
+run_cmd() {
+    # v6: run.sh runs once per boot and stays on the stick (v5 renamed it to run.sh.done,
+    # so a script that installed ssh keys only ever ran on one boot)
+    [ "$ran" = 1 ] && return 0
+    [ -f "$MNT/run.sh" ] || return 0
+    ran=1
+    debugfs
+    log "running run.sh (uptime $up)"
+    bb sh "$MNT/run.sh" >"$LOGD/run-$up.txt" 2>&1
+    log "run.sh exit $? -> run-$up.txt"
+}
 do_round() {
     local up='' rest p1=''
     round=$((round + 1))
@@ -183,11 +199,13 @@ do_round() {
         printf '== /sys/bus/platform/drivers\n'; bb ls "$ROOT/sys/bus/platform/drivers"
         printf '== /proc/1/mounts\n'; bb cat "$ROOT/proc/1/mounts"
     } >"$LOGD/state.txt.new" 2>&1 && bb mv -f "$LOGD/state.txt.new" "$LOGD/state.txt" 2>"$NULL"
+    [ $((round % 10)) -eq 1 ] || [ "$p1" != "$p0" ] && dump
+    p0="$p1"
+    run_cmd
     [ -s ./surfacelog.log ] && bb cp ./surfacelog.log "$LOGD/surfacelog.log" 2>"$NULL"
     bb sync 2>"$NULL"
     return 0
 }
-# page the previous boot's console-ramoops to stdout (/dev/console)
 show() {
     local f n t p a b
     for f in ./pstore/console-ramoops*; do [ -f "$f" ] && break; done
@@ -216,7 +234,6 @@ EOF
     return 0
 }
 
-# stage previous-boot pstore files; with surfacelog_show=1 page them to the console
 _sl_pstore() {
     local f n=0
     mount -t pstore pstore /sys/fs/pstore 2>/dev/null
@@ -254,7 +271,6 @@ _sl_start_loop() {
     return 0
 }
 
-# foreground: give the loop up to surfacelog_wait s (default 25, capped by surfacelog_reboot) to mount
 _sl_wait() {
     local i=0 w
     w="$(getarg surfacelog_wait 25 2>/dev/null)"
