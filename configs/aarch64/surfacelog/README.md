@@ -1,6 +1,7 @@
 # surfacelog — initramfs add-on that logs a live boot to the boot stick
 
-A second, uncompressed initrd (`surfacelog.cpio`, newc, 14 KiB) that GRUB
+A second, uncompressed initrd (`surfacelog.cpio`, newc, exactly 14336 bytes:
+12800 of archive plus zero padding so it fills the ISO slot) that GRUB
 appends to the archiso initramfs. It adds `hooks/surfacelog` and replaces
 `config` so the hook runs right after `udev`, as the first late hook and the
 first emergency hook. From then on the kernel log and some device state are
@@ -70,9 +71,20 @@ boot-N/dmesg-emergency.txt, mounts-emergency.txt               from the emergenc
 boot-N/surfacelog.log         the hook's own log (device search, mount errors, loop messages)
 ```
 
-`sync` runs after every round, so at most ~3 s are lost on a hard hang. The
-hook also prints `surfacelog: …` lines to `/dev/kmsg`, so they appear in the
-dmesg dumps. The FAT partition of an archiso stick is sized tightly; check
+`sync` runs after every round, so at most ~3 s are lost on a hard hang.
+
+Every step is also written to the kernel log as `surfacelog: …` (the loop keeps
+an fd to `/dev/kmsg` open across switch_root), so even when nothing reaches the
+stick, a later `dmesg`/journal shows: hook start, runtime copies ready, device
+search progress every 5 s (what `/dev/disk/by-label` contains, `blkid -lt
+LABEL=ARCHISO_EFI`, `/dev/sd?2`), the exact mount command with exit status and
+stderr, the boot directory created, the first three dmesg writes and then one
+every 30 s, and the switch_root / emergency markers. Device search order: the
+by-label symlink (polled 0.5 s for `surfacelog_wait` seconds, default 25),
+`blkid -lt LABEL=`, then — retried every 3 s by the loop, also after
+switch_root — partition 2 of the device behind `/run/archiso/bootmnt` and every
+`/dev/sd?2`, each verified with `blkid -p` to have `LABEL=ARCHISO_EFI` or
+`TYPE=vfat`; the line `mount … (<how found>) -> rc=0` says which one worked. The FAT partition of an archiso stick is sized tightly; check
 `df` for a few MiB of free space and delete old `boot-N` directories now and
 then.
 

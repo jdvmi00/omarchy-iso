@@ -1,255 +1,200 @@
 #!/usr/bin/ash
-# surfacelog -- mkinitcpio runtime hook that keeps writing the kernel log to
-# the FAT partition labelled ARCHISO_EFI on the boot stick, so a boot can be
-# debugged on a machine with no working display/keyboard/network.
-#
-# Never fails the boot: no set -e, every step guarded, all functions return 0.
-#
-# Layout (all under /run, which util-linux switch_root MS_MOVEs into the real
-# root together with its sub-mounts):
-#   /run/surfacelog            vfat mount of ARCHISO_EFI
-#   /run/surfacelog/boot-N/    logs of this boot (N from /run/surfacelog/boot-count)
-#   /run/surfacelog-rt/        runtime dir: loop.sh, copies of busybox/ld.so/libs,
-#                              mount, blkid, surfacelog.log, bootnum, loop.pid
-#
-# Why the runtime copies: a process left behind by init keeps the *old*
-# initramfs rootfs as its root, and switch_root deletes everything in it.
-# Absolute paths (/usr/bin/dmesg, /proc, /dev...) stop resolving for that
-# process, and even a relative exec of a new-root binary fails because the
-# kernel resolves the ELF interpreter (/lib/ld-linux-*.so) against the
-# process root.  The loop therefore chdirs into /run/surfacelog-rt, uses only
-# relative paths (../surfacelog = log partition, ../.. = whatever root /run is
-# mounted in, i.e. the real root after switch_root) and runs its own copy of
-# busybox through its own copy of the dynamic loader:
-#   ./ld.so --library-path ./lib ./busybox APPLET ...
-# This is fully independent of the initramfs contents and of the real root.
+# surfacelog: keep writing dmesg/state to the ARCHISO_EFI FAT partition every 3 s,
+# before and after switch_root, so a headless boot can be debugged from the stick.
+# switch_root deletes the initramfs and leaves us rooted in it, so the loop lives in
+# /run/surfacelog-rt (moved with /run), uses only relative paths and its own copies of
+# busybox/ld.so/libs/mount/blkid. Never fails the boot. See README.md.
 
 _sl_rt=/run/surfacelog-rt
 _sl_mnt=/run/surfacelog
 _sl_label=ARCHISO_EFI
 
 _sl_log() {
-    # to kernel log (shows up in the dmesg dumps), console (unless quiet) and hook log
-    printf '<6>surfacelog: %s\n' "$*" >/dev/kmsg 2>/dev/null
+    echo "surfacelog: $*" >/dev/kmsg 2>/dev/null
     msg ":: surfacelog: $*" 2>/dev/null
-    printf '%s\n' "surfacelog: $*" >>"$_sl_rt/surfacelog.log" 2>/dev/null
+    echo "surfacelog: $*" >>"$_sl_rt/surfacelog.log" 2>/dev/null
     return 0
 }
 
-_sl_uptime() {
+_sl_up() {
     local up rest
     read -r up rest 2>/dev/null </proc/uptime || up='?'
     printf '%s' "$up"
 }
 
-# absolute path of this boot's log dir, or empty if the partition isn't mounted
 _sl_dir() {
     local n=''
     read -r n 2>/dev/null <"$_sl_rt/bootnum"
-    case "$n" in
-        ''|*[!0-9]*) return 0 ;;
-    esac
+    case "$n" in ''|*[!0-9]*) return 0 ;; esac
     [ -d "$_sl_mnt/boot-$n" ] && printf '%s' "$_sl_mnt/boot-$n"
     return 0
 }
 
-# copy busybox + loader + libs + util-linux mount/blkid into $_sl_rt (tmpfs)
 _sl_prepare_rt() {
     local bb='' ld='' p f
-
     mkdir -p "$_sl_rt/lib" "$_sl_mnt" 2>/dev/null
-
     for p in /usr/bin/busybox /bin/busybox; do
         [ -f "$p" ] && { bb="$p"; break; }
     done
     if [ -n "$bb" ]; then
         cp "$bb" "$_sl_rt/busybox" 2>/dev/null
     else
-        # every applet is busybox, so cat's own executable is busybox
         cat /proc/self/exe >"$_sl_rt/busybox" 2>/dev/null
         bb="$_sl_rt/busybox"
     fi
     chmod 755 "$_sl_rt/busybox" 2>/dev/null
-
     for p in /usr/lib/ld-linux-*.so* /lib/ld-linux-*.so* /lib64/ld-linux-*.so* /usr/lib/ld-*.so* /lib/ld-*.so*; do
         [ -f "$p" ] && { ld="$p"; break; }
     done
     if [ -z "$ld" ]; then
-        _sl_log "no dynamic loader found; background loop will die at switch_root"
+        _sl_log "no dynamic loader found; loop will die at switch_root"
         return 0
     fi
     cp "$ld" "$_sl_rt/ld.so" 2>/dev/null
-    chmod 755 "$_sl_rt/ld.so" 2>/dev/null
-
-    # util-linux mount/blkid are needed for mount retries after switch_root
     for p in /usr/bin/mount /usr/bin/blkid; do
-        [ -f "$p" ] && cp "$p" "$_sl_rt/${p##*/}" 2>/dev/null && chmod 755 "$_sl_rt/${p##*/}" 2>/dev/null
+        [ -f "$p" ] && cp "$p" "$_sl_rt/${p##*/}" 2>/dev/null
     done
-
+    chmod 755 "$_sl_rt"/* 2>/dev/null
     for p in "$bb" "$_sl_rt/mount" "$_sl_rt/blkid"; do
         [ -f "$p" ] || continue
         "$ld" --list "$p" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// { print $3 }' | while read -r f; do
             [ -e "$_sl_rt/lib/${f##*/}" ] || cp "$f" "$_sl_rt/lib/${f##*/}" 2>/dev/null
         done
     done
-
     if "$_sl_rt/ld.so" --library-path "$_sl_rt/lib" "$_sl_rt/busybox" true 2>/dev/null; then
         _sl_log "runtime copies ready in $_sl_rt (loader $ld)"
     else
-        _sl_log "self-contained runtime failed (loader $ld); loop will fall back to PATH and die at switch_root"
+        _sl_log "self-contained runtime failed (loader $ld); loop will die at switch_root"
         rm -f "$_sl_rt/ld.so" 2>/dev/null
     fi
     return 0
 }
 
-# the loop script; written to $_sl_rt/loop.sh, run once in the foreground and
-# then forever in the background.  Runs with cwd=$_sl_rt and relative paths only.
 _sl_write_loop() {
     cat >"$_sl_rt/loop.sh" <<'EOF'
 #!/usr/bin/ash
-# surfacelog runtime loop.  usage: loop.sh once|loop [DEVICE] [HOW-FOUND]
-# Written by /hooks/surfacelog; cwd is fixed to /run/surfacelog-rt, everything
-# else is relative so it keeps working after switch_root wipes the initramfs.
+# surfacelog loop: loop.sh once|loop [DEVICE] [HOW-FOUND]; cwd fixed, relative paths only
 mode="$1" dev="$2" found="$3"
 cd /run/surfacelog-rt || exit 0
-
-ROOT=../..          # the root /run is mounted in (initramfs root, later the real root)
-MNT=../surfacelog   # the ARCHISO_EFI vfat mount
-NULL=./null         # error sink (a /dev/null path is NOT reachable after switch_root)
-LOGD=''             # $MNT/boot-N once known
-round=0
-
+ROOT=../.. MNT=../surfacelog NULL=./null LOGD='' round=0 d='' how=''
 if [ -x ./ld.so ] && [ -x ./busybox ]; then
     bb() { ./ld.so --library-path ./lib ./busybox "$@"; }
-else
-    bb() { busybox "$@"; }
-fi
-if [ -x ./ld.so ] && [ -x ./mount ]; then
     do_mount() { ./ld.so --library-path ./lib ./mount "$@"; }
-else
-    do_mount() { mount "$@"; }
-fi
-if [ -x ./ld.so ] && [ -x ./blkid ]; then
     do_blkid() { ./ld.so --library-path ./lib ./blkid "$@"; }
 else
+    bb() { busybox "$@"; }
+    do_mount() { mount "$@"; }
     do_blkid() { blkid "$@"; }
 fi
-
-log() { printf 'loop: %s\n' "$*" >&2; }
-
-# fallback sleep that needs no exec: a fifo opened rw never has data, so
-# read -t just times out.  If even that is unavailable, exit rather than spin.
+# fd 9: kernel log, opened now so it still works after switch_root
+if [ -c "$ROOT/dev/kmsg" ]; then exec 9>"$ROOT/dev/kmsg"; else exec 9>"$NULL"; fi
+log() {
+    printf 'loop: %s\n' "$*" >&2
+    printf 'surfacelog: %s\n' "$*" >&9 2>"$NULL"
+}
 [ -p ./sleep.fifo ] || bb mkfifo ./sleep.fifo 2>"$NULL"
 [ -p ./sleep.fifo ] && exec 3<>./sleep.fifo
 nap() {
     bb sleep "$1" 2>"$NULL" && return 0
-    if [ -p ./sleep.fifo ]; then
-        read -r -t "$1" _ 2>"$NULL" <&3
-        return 0
-    fi
-    log "no way to sleep, exiting"
-    exit 0
+    [ -p ./sleep.fifo ] && { read -r -t "$1" _ 2>"$NULL" <&3; return 0; }
+    log "no way to sleep, exiting"; exit 0
 }
-
 is_mounted() { bb mountpoint -q "$MNT" 2>"$NULL"; }
 
-try_mount() {
-    local d='' c
-    is_mounted && return 0
-    for c in "${dev:+$ROOT$dev}" "$ROOT/dev/disk/by-label/ARCHISO_EFI"; do
-        [ -n "$c" ] && [ -b "$c" ] && { d="$c"; break; }
-    done
-    if [ -z "$d" ]; then
-        c="$(do_blkid -lt LABEL=ARCHISO_EFI -o device 2>"$NULL")"
-        [ -n "$c" ] && [ -b "$ROOT$c" ] && d="$ROOT$c"
-    fi
-    [ -n "$d" ] || return 1
-    # -c: no path canonicalisation (getcwd is "(unreachable)" after switch_root)
-    if do_mount -c -t vfat -o rw,noatime,flush "$d" "$MNT" 2>&1 || do_mount -c -o rw "$d" "$MNT" 2>&1; then
-        found="mounted by loop retry from $d"
-        log "$found"
-        return 0
-    fi
+# blkid -p: no cache file needed; ok if LABEL=ARCHISO_EFI or TYPE=vfat
+is_efi() {
+    case "$(do_blkid -p -o export "$1" 2>"$NULL")" in *LABEL=ARCHISO_EFI*|*TYPE=vfat*) return 0 ;; esac
     return 1
 }
-
+find_dev() {
+    local c s m rest b
+    d=''
+    for c in "${dev:+$ROOT$dev}" "$ROOT/dev/disk/by-label/ARCHISO_EFI"; do
+        [ -n "$c" ] && [ -b "$c" ] && { d="$c" how="by-label/$dev"; return 0; }
+    done
+    # partition 2 of the archiso boot device (source of /run/archiso/bootmnt)
+    s="$(while read -r c m rest; do [ "$m" = /run/archiso/bootmnt ] && { echo "$c"; break; }; done <"$ROOT/proc/1/mounts" 2>"$NULL")"
+    b="$s"
+    if [ -n "$b" ]; then
+        while case "$b" in *[0-9]) : ;; *) false ;; esac; do b="${b%[0-9]}"; done
+        case "$b" in *[0-9]p) b="${b%p}" ;; esac
+        case "$b" in *[0-9]) b="${b}p2" ;; *) b="${b}2" ;; esac
+        if [ -b "$ROOT$b" ] && is_efi "$ROOT$b"; then d="$ROOT$b" how="partition 2 of archiso bootmnt device $s"; return 0; fi
+        log "bootmnt device $s -> $b: not a usable vfat partition"
+    fi
+    for c in "$ROOT"/dev/sd?2; do
+        [ -b "$c" ] && is_efi "$c" && { d="$c" how="scan of /dev/sd?2 (${c#$ROOT})"; return 0; }
+    done
+    return 1
+}
+try_mount() {
+    local err rc
+    is_mounted && return 0
+    if ! find_dev; then
+        [ $((round % 2)) -eq 1 ] && log "no ARCHISO_EFI yet; by-label: $(echo $(bb ls "$ROOT/dev/disk/by-label" 2>&1)) sd?2: $(echo "$ROOT"/dev/sd?2) bootmnt mounted: $(bb grep -c bootmnt "$ROOT/proc/1/mounts" 2>"$NULL")"
+        return 1
+    fi
+    err="$(do_mount -c -t vfat -o rw,noatime,flush "$d" "$MNT" 2>&1)"; rc=$?
+    log "mount -c -t vfat -o rw,noatime,flush $d $MNT ($how) -> rc=$rc $err"
+    if [ "$rc" -ne 0 ]; then
+        err="$(do_mount -c -o rw "$d" "$MNT" 2>&1)"; rc=$?
+        log "mount -c -o rw $d $MNT -> rc=$rc $err"
+    fi
+    [ "$rc" -eq 0 ] || return 1
+    found="$how"
+    return 0
+}
 setup_dir() {
     local n='' bn=''
     [ -n "$LOGD" ] && [ -d "$LOGD" ] && return 0
     is_mounted || return 1
     read -r bn 2>"$NULL" <./bootnum
-    case "$bn" in
-        ''|*[!0-9]*) bn='' ;;
-    esac
-    if [ -n "$bn" ] && [ -d "$MNT/boot-$bn" ]; then
-        LOGD="$MNT/boot-$bn"
-        return 0
-    fi
+    case "$bn" in ''|*[!0-9]*) bn='' ;; esac
+    if [ -n "$bn" ] && [ -d "$MNT/boot-$bn" ]; then LOGD="$MNT/boot-$bn"; return 0; fi
     read -r n 2>"$NULL" <"$MNT/boot-count"
-    case "$n" in
-        ''|*[!0-9]*) n=0 ;;
-    esac
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
     n=$((n + 1))
     printf '%s\n' "$n" >"$MNT/boot-count" 2>"$NULL"
-    bb mkdir -p "$MNT/boot-$n" 2>"$NULL" || return 1
+    bb mkdir -p "$MNT/boot-$n" 2>"$NULL" || { log "mkdir $MNT/boot-$n failed"; return 1; }
     LOGD="$MNT/boot-$n"
     printf '%s\n' "$n" >./bootnum
     {
-        printf 'surfacelog boot #%s\n' "$n"
-        printf 'log partition: %s\n' "${found:-found mounted at $MNT by the loop}"
-        printf '== /proc/version\n'; bb cat "$ROOT/proc/version"
-        printf '== /proc/cmdline\n'; bb cat "$ROOT/proc/cmdline"
+        printf 'surfacelog boot #%s\nlog partition: %s\n== /proc/version\n' "$n" "${found:-$how}"
+        bb cat "$ROOT/proc/version"; printf '== /proc/cmdline\n'; bb cat "$ROOT/proc/cmdline"
     } >"$LOGD/info.txt" 2>&1
-    log "logging to $LOGD"
+    log "created $LOGD (boot #$n), logging there"
     return 0
 }
-
 do_round() {
     local up='' rest p1=''
     round=$((round + 1))
     read -r up rest 2>"$NULL" <"$ROOT/proc/uptime" || up='?'
     read -r p1 2>"$NULL" <"$ROOT/proc/1/comm" || p1='?'
-    if ! setup_dir; then
-        try_mount && setup_dir
-    fi
-    if [ -z "$LOGD" ]; then
-        log "round $round uptime $up: log partition not mounted yet"
-        return 0
-    fi
-    # kernel log (klogctl, no filesystem needed); written to a temp file first
-    # so an interrupted write never destroys the previous snapshot
-    if bb dmesg >"$LOGD/dmesg.txt.new" 2>&1; then
-        bb mv -f "$LOGD/dmesg.txt.new" "$LOGD/dmesg.txt" 2>"$NULL"
+    setup_dir || { try_mount && setup_dir; }
+    [ -n "$LOGD" ] || return 0
+    if bb dmesg >"$LOGD/dmesg.txt.new" 2>&1 && bb mv -f "$LOGD/dmesg.txt.new" "$LOGD/dmesg.txt" 2>"$NULL"; then
+        [ "$round" -le 3 ] || [ $((round % 10)) -eq 0 ] && log "round $round: wrote $LOGD/dmesg.txt (uptime $up pid1=$p1)"
+    else
+        log "round $round: dmesg write failed"
     fi
     printf 'round %s uptime %s pid1=%s\n' "$round" "$up" "$p1" >>"$LOGD/heartbeat.txt" 2>"$NULL"
     {
-        printf '== round %s uptime %s pid1=%s\n' "$round" "$up" "$p1"
-        printf '== ls -l /dev/disk/by-label /dev/disk/by-id\n'
+        printf '== round %s uptime %s pid1=%s\n== ls -l /dev/disk/by-label /dev/disk/by-id\n' "$round" "$up" "$p1"
         bb ls -l "$ROOT/dev/disk/by-label" "$ROOT/dev/disk/by-id" 2>"$NULL"
-        printf '== /proc/modules\n'
-        bb cat "$ROOT/proc/modules"
-        printf '== /sys/bus/platform/drivers\n'
-        bb ls "$ROOT/sys/bus/platform/drivers"
-        printf '== /proc/1/mounts\n'
-        bb cat "$ROOT/proc/1/mounts"
+        printf '== /proc/modules\n'; bb cat "$ROOT/proc/modules"
+        printf '== /sys/bus/platform/drivers\n'; bb ls "$ROOT/sys/bus/platform/drivers"
+        printf '== /proc/1/mounts\n'; bb cat "$ROOT/proc/1/mounts"
     } >"$LOGD/state.txt.new" 2>&1 && bb mv -f "$LOGD/state.txt.new" "$LOGD/state.txt" 2>"$NULL"
     [ -s ./surfacelog.log ] && bb cp ./surfacelog.log "$LOGD/surfacelog.log" 2>"$NULL"
     bb sync 2>"$NULL"
     return 0
 }
-
 case "$mode" in
-    once)
-        do_round
-        ;;
+    once) do_round ;;
     loop)
         trap '' HUP PIPE
         log "background loop started (pid $$)"
-        while :; do
-            do_round
-            nap 3
-        done
-        ;;
+        while :; do do_round; nap 3; done ;;
 esac
 exit 0
 EOF
@@ -257,10 +202,9 @@ EOF
     return 0
 }
 
-# find the ARCHISO_EFI partition; sets _sl_dev and _sl_found
+# poll for the label; the loop script does the fallback searches (bootmnt device, sd?2)
 _sl_find_dev() {
-    local i=0 max d wait override
-
+    local i=0 max d wait o
     _sl_dev='' _sl_found=''
     if mountpoint -q "$_sl_mnt" 2>/dev/null; then
         _sl_found="$_sl_mnt was already mounted"
@@ -269,65 +213,57 @@ _sl_find_dev() {
     wait="$(getarg surfacelog_wait 25 2>/dev/null)"
     case "$wait" in ''|*[!0-9]*) wait=25 ;; esac
     max=$((wait * 2))
-
-    override="$(getarg surfacelog_dev 2>/dev/null)"
-    if [ -n "$override" ]; then
-        if d="$(resolve_device "$override" 2>/dev/null)" && [ -b "$d" ]; then
-            _sl_dev="$d" _sl_found="surfacelog_dev=$override -> $d"
+    o="$(getarg surfacelog_dev 2>/dev/null)"
+    if [ -n "$o" ]; then
+        if d="$(resolve_device "$o" 2>/dev/null)" && [ -b "$d" ]; then
+            _sl_dev="$d" _sl_found="surfacelog_dev=$o -> $d"
             return 0
         fi
-        _sl_log "surfacelog_dev=$override did not resolve, falling back to label $_sl_label"
+        _sl_log "surfacelog_dev=$o did not resolve"
     fi
-
     while [ "$i" -lt "$max" ]; do
         if [ -b "/dev/disk/by-label/$_sl_label" ]; then
             d="$(readlink -f "/dev/disk/by-label/$_sl_label" 2>/dev/null)"
             [ -b "$d" ] || d="/dev/disk/by-label/$_sl_label"
-            _sl_dev="$d" _sl_found="/dev/disk/by-label/$_sl_label -> $d after $((i / 2)).$((i % 2 * 5)) s"
+            _sl_dev="$d" _sl_found="/dev/disk/by-label/$_sl_label -> $d after $((i / 2)) s"
+            _sl_log "found $_sl_found"
             return 0
         fi
-        if [ $((i % 4)) -eq 3 ]; then
-            d="$(blkid -lt "LABEL=$_sl_label" -o device 2>/dev/null)"
-            if [ -n "$d" ] && [ -b "$d" ]; then
-                _sl_dev="$d" _sl_found="blkid -lt LABEL=$_sl_label -> $d after $((i / 2)).$((i % 2 * 5)) s (no by-label symlink)"
+        if [ $((i % 10)) -eq 9 ]; then
+            d="$(blkid -lt "LABEL=$_sl_label" -o device 2>&1)"
+            _sl_log "search $((i / 2 + 1)) s: by-label has: $(echo $(ls /dev/disk/by-label 2>&1)); blkid -lt LABEL=$_sl_label: ${d:-nothing}; sd?2: $(echo /dev/sd?2)"
+            if [ -b "$d" ]; then
+                _sl_dev="$d" _sl_found="blkid -> $d after $((i / 2)) s (no by-label symlink)"
                 return 0
-            fi
-            if command -v findfs >/dev/null 2>&1; then
-                d="$(findfs "LABEL=$_sl_label" 2>/dev/null)"
-                if [ -n "$d" ] && [ -b "$d" ]; then
-                    _sl_dev="$d" _sl_found="findfs LABEL=$_sl_label -> $d after $((i / 2)).$((i % 2 * 5)) s (no by-label symlink)"
-                    return 0
-                fi
             fi
         fi
         sleep 0.5 2>/dev/null || sleep 1
         i=$((i + 1))
     done
-    _sl_log "no device labelled $_sl_label after $wait s (by-label, blkid, findfs); loop will keep retrying"
+    _sl_log "no by-label/blkid match after $wait s; trying bootmnt/sd?2 fallbacks and retrying every 3 s"
     return 1
 }
 
 _sl_mount() {
-    if mountpoint -q "$_sl_mnt" 2>/dev/null; then
-        return 0
-    fi
+    local err rc
+    mountpoint -q "$_sl_mnt" 2>/dev/null && return 0
     modprobe -qab vfat nls_cp437 nls_ascii nls_utf8 2>/dev/null
+    _sl_log "vfat in /proc/filesystems: $(grep -c vfat /proc/filesystems 2>/dev/null)"
     [ -n "$_sl_dev" ] || return 1
-    if mount -t vfat -o rw,noatime,flush "$_sl_dev" "$_sl_mnt" 2>>"$_sl_rt/surfacelog.log" \
-        || mount -t vfat -o rw "$_sl_dev" "$_sl_mnt" 2>>"$_sl_rt/surfacelog.log" \
-        || mount -o rw "$_sl_dev" "$_sl_mnt" 2>>"$_sl_rt/surfacelog.log"; then
-        _sl_log "mounted $_sl_dev on $_sl_mnt ($_sl_found)"
-        return 0
+    err="$(mount -t vfat -o rw,noatime,flush "$_sl_dev" "$_sl_mnt" 2>&1)"; rc=$?
+    _sl_log "mount -t vfat -o rw,noatime,flush $_sl_dev $_sl_mnt -> rc=$rc $err"
+    if [ "$rc" -ne 0 ]; then
+        err="$(mount -o rw "$_sl_dev" "$_sl_mnt" 2>&1)"; rc=$?
+        _sl_log "mount -o rw $_sl_dev $_sl_mnt -> rc=$rc $err"
     fi
-    _sl_log "mount of $_sl_dev on $_sl_mnt failed; loop will keep retrying"
+    [ "$rc" -eq 0 ] && return 0
+    _sl_log "mount failed; loop will keep retrying"
     return 1
 }
 
 _sl_start_loop() {
     local pid=''
-    # foreground first round: boot-N dir, info.txt, dmesg.txt, state.txt
     ash "$_sl_rt/loop.sh" once "$_sl_dev" "$_sl_found" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1
-    # background loop; stdio detached from init's console / rdlogger pipe
     if command -v setsid >/dev/null 2>&1; then
         setsid ash "$_sl_rt/loop.sh" loop "$_sl_dev" "$_sl_found" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1 &
     else
@@ -335,17 +271,17 @@ _sl_start_loop() {
     fi
     pid=$!
     printf '%s\n' "$pid" >"$_sl_rt/loop.pid" 2>/dev/null
-    _sl_log "background loop pid $pid, log dir $(_sl_dir)"
+    _sl_log "background loop pid $pid, log dir '$(_sl_dir)' (uptime $(_sl_up))"
     return 0
 }
 
 _sl_marker() {
     local dir
     dir="$(_sl_dir)"
-    _sl_log "$1 (uptime $(_sl_uptime))"
+    _sl_log "$1 (uptime $(_sl_up), log dir '$dir')"
     [ -n "$dir" ] || return 0
-    printf '%s (uptime %s)\n' "$1" "$(_sl_uptime)" >>"$dir/markers.txt" 2>/dev/null
-    [ -n "$2" ] && dmesg >"$dir/$2" 2>/dev/null
+    printf '%s (uptime %s)\n' "$1" "$(_sl_up)" >>"$dir/markers.txt" 2>/dev/null
+    dmesg >"$dir/$2" 2>/dev/null
     cat /proc/self/mounts >"$dir/mounts-${2#dmesg-}" 2>/dev/null
     sync 2>/dev/null
     return 0
@@ -354,7 +290,7 @@ _sl_marker() {
 run_hook() {
     mkdir -p "$_sl_rt" "$_sl_mnt" 2>/dev/null
     {
-        _sl_log "hook start (uptime $(_sl_uptime))"
+        _sl_log "hook start (uptime $(_sl_up))"
         _sl_prepare_rt
         _sl_write_loop
         _sl_find_dev
@@ -373,5 +309,3 @@ run_emergencyhook() {
     _sl_marker "emergency shell" dmesg-emergency.txt || :
     return 0
 }
-
-# vim: set ft=sh ts=4 sw=4 et:
