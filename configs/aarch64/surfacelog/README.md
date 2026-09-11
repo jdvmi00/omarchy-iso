@@ -1,8 +1,7 @@
 # surfacelog — initramfs add-on that logs a live boot to the boot stick
 
-A second, uncompressed initrd (`surfacelog.cpio`, newc, exactly 14336 bytes:
-12800 of archive plus zero padding so it fills the ISO slot) that GRUB
-appends to the archiso initramfs. It adds `hooks/surfacelog` and replaces
+A second, uncompressed initrd (`surfacelog.cpio`, newc, exactly 14336 bytes,
+the size of its slot on the ISO) that GRUB appends to the archiso initramfs. It adds `hooks/surfacelog` and replaces
 `config` so the hook runs right after `udev`, as the first late hook and the
 first emergency hook. From then on the kernel log and some device state are
 rewritten every 3 s onto the stick's FAT partition `ARCHISO_EFI`, before *and*
@@ -38,8 +37,28 @@ partition. Useful additions to the `linux` line:
   where init stops).
 - `log_buf_len=8M` — so an early flood of messages is not lost from `dmesg`.
 - `surfacelog_wait=N` (default 25 s to wait for the partition),
-  `surfacelog_dev=/dev/sdX2` or `LABEL=…` (override the device),
+  `surfacelog_dev=/dev/sdX2` (override the device; a plain device path),
   `disablehooks=surfacelog` (turn the hook off without touching the cpio).
+- `surfacelog_reboot=N` (default 0 = off): if the log partition is still not
+  mounted N seconds after the hook started, the loop logs
+  `surfacelog: no log device after N s, rebooting to preserve ramoops`, runs
+  `sync`, waits 3 s, enables sysrq and writes `b` to `/proc/sysrq-trigger`
+  (warm reset, ramoops kept). Works before and after switch_root (the loop
+  reaches `/proc` as `../../proc`). The initial by-label poll is shortened to N
+  so the reset is not delayed by it.
+- `surfacelog_show=1`: `run_hook` mounts pstore and, if
+  `/sys/fs/pstore/console-ramoops*` or `dmesg-ramoops*` exist, pages the
+  previous boot's console log to `/dev/console` in the background: first a
+  50-line summary (case-insensitive matches of
+  `surfacelog|dwc3|xhci|usb|phy|dp_|drm|msm|panel|edp|error|fail|timeout|-110|-517`,
+  deduplicated, most recent last), then the last 1200 lines in pages of 50
+  with a `=== surfacelog: previous boot console log, page P/T (lines A-B of N) ===`
+  header and 12 s between pages. The plymouth hook is disabled for that boot
+  (`chmod 644 /hooks/plymouth`, the same thing `disablehooks=` does) so the
+  splash cannot cover the text. If pstore is empty, one line saying so goes to
+  the console and kmsg. Independently of this knob, all pstore files are staged
+  in `/run/surfacelog-rt/pstore/` and copied into `boot-N/pstore-<name>` if the
+  partition ever mounts.
 
 Concatenated initrds are fine: mkinitcpio's `/init` only reads `/config` and
 `/hooks/*` from the unpacked rootfs, and the kernel unpacks each archive of the

@@ -1,9 +1,7 @@
 #!/usr/bin/ash
-# surfacelog: keep writing dmesg/state to the ARCHISO_EFI FAT partition every 3 s,
-# before and after switch_root, so a headless boot can be debugged from the stick.
-# switch_root deletes the initramfs and leaves us rooted in it, so the loop lives in
-# /run/surfacelog-rt (moved with /run), uses only relative paths and its own copies of
-# busybox/ld.so/libs/mount/blkid. Never fails the boot. See README.md.
+# surfacelog: write dmesg/state to the ARCHISO_EFI FAT partition every 3 s, before and
+# after switch_root (loop in /run/surfacelog-rt with relative paths + own busybox/ld.so
+# copies, since switch_root wipes the initramfs we stay rooted in). Never fails the boot.
 
 _sl_rt=/run/surfacelog-rt
 _sl_mnt=/run/surfacelog
@@ -31,19 +29,11 @@ _sl_dir() {
 }
 
 _sl_prepare_rt() {
-    local bb='' ld='' p f
+    local bb=/usr/bin/busybox ld='' p f
     mkdir -p "$_sl_rt/lib" "$_sl_mnt" 2>/dev/null
-    for p in /usr/bin/busybox /bin/busybox; do
-        [ -f "$p" ] && { bb="$p"; break; }
-    done
-    if [ -n "$bb" ]; then
-        cp "$bb" "$_sl_rt/busybox" 2>/dev/null
-    else
-        cat /proc/self/exe >"$_sl_rt/busybox" 2>/dev/null
-        bb="$_sl_rt/busybox"
-    fi
-    chmod 755 "$_sl_rt/busybox" 2>/dev/null
-    for p in /usr/lib/ld-linux-*.so* /lib/ld-linux-*.so* /lib64/ld-linux-*.so* /usr/lib/ld-*.so* /lib/ld-*.so*; do
+    [ -f "$bb" ] || bb=/bin/busybox
+    cp "$bb" "$_sl_rt/busybox" 2>/dev/null
+    for p in /usr/lib/ld-*.so* /lib/ld-*.so* /lib64/ld-*.so*; do
         [ -f "$p" ] && { ld="$p"; break; }
     done
     if [ -z "$ld" ]; then
@@ -73,8 +63,8 @@ _sl_prepare_rt() {
 _sl_write_loop() {
     cat >"$_sl_rt/loop.sh" <<'EOF'
 #!/usr/bin/ash
-# surfacelog loop: loop.sh once|loop [DEVICE] [HOW-FOUND]; cwd fixed, relative paths only
-mode="$1" dev="$2" found="$3"
+# surfacelog loop: loop.sh once|loop|show [DEV HOW START REBOOT]; cwd fixed, relative paths only
+mode="$1" dev="$2" found="$3" start="${4:-0}" rb="${5:-0}"
 cd /run/surfacelog-rt || exit 0
 ROOT=../.. MNT=../surfacelog NULL=./null LOGD='' round=0 d='' how=''
 if [ -x ./ld.so ] && [ -x ./busybox ]; then
@@ -86,7 +76,6 @@ else
     do_mount() { mount "$@"; }
     do_blkid() { blkid "$@"; }
 fi
-# fd 9: kernel log, opened now so it still works after switch_root
 if [ -c "$ROOT/dev/kmsg" ]; then exec 9>"$ROOT/dev/kmsg"; else exec 9>"$NULL"; fi
 log() {
     printf 'loop: %s\n' "$*" >&2
@@ -100,8 +89,6 @@ nap() {
     log "no way to sleep, exiting"; exit 0
 }
 is_mounted() { bb mountpoint -q "$MNT" 2>"$NULL"; }
-
-# blkid -p: no cache file needed; ok if LABEL=ARCHISO_EFI or TYPE=vfat
 is_efi() {
     case "$(do_blkid -p -o export "$1" 2>"$NULL")" in *LABEL=ARCHISO_EFI*|*TYPE=vfat*) return 0 ;; esac
     return 1
@@ -112,7 +99,6 @@ find_dev() {
     for c in "${dev:+$ROOT$dev}" "$ROOT/dev/disk/by-label/ARCHISO_EFI"; do
         [ -n "$c" ] && [ -b "$c" ] && { d="$c" how="by-label/$dev"; return 0; }
     done
-    # partition 2 of the archiso boot device (source of /run/archiso/bootmnt)
     s="$(while read -r c m rest; do [ "$m" = /run/archiso/bootmnt ] && { echo "$c"; break; }; done <"$ROOT/proc/1/mounts" 2>"$NULL")"
     b="$s"
     if [ -n "$b" ]; then
@@ -136,16 +122,12 @@ try_mount() {
     fi
     err="$(do_mount -c -t vfat -o rw,noatime,flush "$d" "$MNT" 2>&1)"; rc=$?
     log "mount -c -t vfat -o rw,noatime,flush $d $MNT ($how) -> rc=$rc $err"
-    if [ "$rc" -ne 0 ]; then
-        err="$(do_mount -c -o rw "$d" "$MNT" 2>&1)"; rc=$?
-        log "mount -c -o rw $d $MNT -> rc=$rc $err"
-    fi
     [ "$rc" -eq 0 ] || return 1
     found="$how"
     return 0
 }
 setup_dir() {
-    local n='' bn=''
+    local n='' bn='' f
     [ -n "$LOGD" ] && [ -d "$LOGD" ] && return 0
     is_mounted || return 1
     read -r bn 2>"$NULL" <./bootnum
@@ -162,6 +144,7 @@ setup_dir() {
         printf 'surfacelog boot #%s\nlog partition: %s\n== /proc/version\n' "$n" "${found:-$how}"
         bb cat "$ROOT/proc/version"; printf '== /proc/cmdline\n'; bb cat "$ROOT/proc/cmdline"
     } >"$LOGD/info.txt" 2>&1
+    for f in ./pstore/*; do [ -f "$f" ] && bb cp "$f" "$LOGD/pstore-${f##*/}" 2>"$NULL"; done
     log "created $LOGD (boot #$n), logging there"
     return 0
 }
@@ -171,7 +154,15 @@ do_round() {
     read -r up rest 2>"$NULL" <"$ROOT/proc/uptime" || up='?'
     read -r p1 2>"$NULL" <"$ROOT/proc/1/comm" || p1='?'
     setup_dir || { try_mount && setup_dir; }
-    [ -n "$LOGD" ] || return 0
+    if [ -z "$LOGD" ]; then
+        if [ "$rb" -gt 0 ] && [ "${up%.*}" -ge $((start + rb - 3)) ] 2>"$NULL"; then
+            log "no log device after $rb s, rebooting to preserve ramoops"
+            bb sync 2>"$NULL"; nap 3; rb=0
+            echo 1 >"$ROOT/proc/sys/kernel/sysrq"
+            echo b >"$ROOT/proc/sysrq-trigger"
+        fi
+        return 0
+    fi
     if bb dmesg >"$LOGD/dmesg.txt.new" 2>&1 && bb mv -f "$LOGD/dmesg.txt.new" "$LOGD/dmesg.txt" 2>"$NULL"; then
         [ "$round" -le 3 ] || [ $((round % 10)) -eq 0 ] && log "round $round: wrote $LOGD/dmesg.txt (uptime $up pid1=$p1)"
     else
@@ -189,8 +180,25 @@ do_round() {
     bb sync 2>"$NULL"
     return 0
 }
+# page the previous boot's console-ramoops to stdout (/dev/console)
+show() {
+    local f n t p a b
+    for f in ./pstore/console-ramoops*; do [ -f "$f" ] && break; done
+    [ -f "$f" ] || exit 0
+    bb tac "$f" | bb grep -iE 'surfacelog|dwc3|xhci|usb|phy|dp_|drm|msm|panel|edp|error|fail|timeout|-110|-517' | bb awk '!s[$0]++' | bb head -n 50 | bb tac >./sum.txt
+    bb tail -n 1200 "$f" >./show.txt
+    n=$(bb wc -l <./show.txt); t=$(( (n + 49) / 50 )); p=0
+    printf '=== surfacelog: previous boot console log, summary: last %s distinct matching lines, most recent last; %s pages of the last %s lines follow, 12 s each ===\n' "$(bb wc -l <./sum.txt)" "$t" "$n"
+    bb cat ./sum.txt
+    while [ "$p" -lt "$t" ]; do
+        nap 12; p=$((p + 1)); a=$(( (p - 1) * 50 + 1 )); b=$((p * 50)); [ "$b" -gt "$n" ] && b=$n
+        printf '=== surfacelog: previous boot console log, page %s/%s (lines %s-%s of %s) ===\n' "$p" "$t" "$a" "$b" "$n"
+        bb sed -n "${a},${b}p" ./show.txt
+    done
+}
 case "$mode" in
     once) do_round ;;
+    show) show ;;
     loop)
         trap '' HUP PIPE
         log "background loop started (pid $$)"
@@ -202,7 +210,29 @@ EOF
     return 0
 }
 
-# poll for the label; the loop script does the fallback searches (bootmnt device, sd?2)
+# stage previous-boot pstore files; with surfacelog_show=1 page them to the console
+_sl_pstore() {
+    local f n=0
+    mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+    mkdir -p "$_sl_rt/pstore" 2>/dev/null
+    for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do
+        [ -f "$f" ] && n=$((n + 1))
+    done
+    cp /sys/fs/pstore/* "$_sl_rt/pstore/" 2>/dev/null
+    _sl_log "pstore: $n console/dmesg ramoops files"
+    [ "$(getarg surfacelog_show)" = 1 ] || return 0
+    if [ "$n" -eq 0 ]; then
+        echo "surfacelog: surfacelog_show=1 but /sys/fs/pstore has no console-ramoops/dmesg-ramoops files" >/dev/console 2>/dev/null
+        _sl_log "surfacelog_show=1 but pstore is empty"
+        return 0
+    fi
+    chmod 644 /hooks/plymouth 2>/dev/null
+    ash "$_sl_rt/loop.sh" show </dev/null >/dev/console 2>>"$_sl_rt/surfacelog.log" &
+    _sl_log "paging previous console log to /dev/console (pid $!, plymouth hook disabled)"
+    return 0
+}
+
+# poll for the label; loop.sh does the fallback searches (bootmnt device, sd?2)
 _sl_find_dev() {
     local i=0 max d wait o
     _sl_dev='' _sl_found=''
@@ -212,14 +242,12 @@ _sl_find_dev() {
     fi
     wait="$(getarg surfacelog_wait 25 2>/dev/null)"
     case "$wait" in ''|*[!0-9]*) wait=25 ;; esac
+    [ "$_sl_rb" -gt 0 ] && [ "$_sl_rb" -lt "$wait" ] && wait=$_sl_rb
     max=$((wait * 2))
     o="$(getarg surfacelog_dev 2>/dev/null)"
-    if [ -n "$o" ]; then
-        if d="$(resolve_device "$o" 2>/dev/null)" && [ -b "$d" ]; then
-            _sl_dev="$d" _sl_found="surfacelog_dev=$o -> $d"
-            return 0
-        fi
-        _sl_log "surfacelog_dev=$o did not resolve"
+    if [ -b "$o" ]; then
+        _sl_dev="$o" _sl_found="surfacelog_dev=$o"
+        return 0
     fi
     while [ "$i" -lt "$max" ]; do
         if [ -b "/dev/disk/by-label/$_sl_label" ]; then
@@ -252,10 +280,6 @@ _sl_mount() {
     [ -n "$_sl_dev" ] || return 1
     err="$(mount -t vfat -o rw,noatime,flush "$_sl_dev" "$_sl_mnt" 2>&1)"; rc=$?
     _sl_log "mount -t vfat -o rw,noatime,flush $_sl_dev $_sl_mnt -> rc=$rc $err"
-    if [ "$rc" -ne 0 ]; then
-        err="$(mount -o rw "$_sl_dev" "$_sl_mnt" 2>&1)"; rc=$?
-        _sl_log "mount -o rw $_sl_dev $_sl_mnt -> rc=$rc $err"
-    fi
     [ "$rc" -eq 0 ] && return 0
     _sl_log "mount failed; loop will keep retrying"
     return 1
@@ -263,15 +287,16 @@ _sl_mount() {
 
 _sl_start_loop() {
     local pid=''
-    ash "$_sl_rt/loop.sh" once "$_sl_dev" "$_sl_found" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1
+    set -- "$_sl_rt/loop.sh" loop "$_sl_dev" "$_sl_found" "${_sl_start%.*}" "$_sl_rb"
+    ash "$1" once "$3" "$4" "$5" "$6" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1
     if command -v setsid >/dev/null 2>&1; then
-        setsid ash "$_sl_rt/loop.sh" loop "$_sl_dev" "$_sl_found" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1 &
+        setsid ash "$@" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1 &
     else
-        ash "$_sl_rt/loop.sh" loop "$_sl_dev" "$_sl_found" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1 &
+        ash "$@" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1 &
     fi
     pid=$!
     printf '%s\n' "$pid" >"$_sl_rt/loop.pid" 2>/dev/null
-    _sl_log "background loop pid $pid, log dir '$(_sl_dir)' (uptime $(_sl_up))"
+    _sl_log "background loop pid $pid, log dir '$(_sl_dir)', reboot-if-unmounted after ${_sl_rb}s (uptime $(_sl_up))"
     return 0
 }
 
@@ -290,9 +315,13 @@ _sl_marker() {
 run_hook() {
     mkdir -p "$_sl_rt" "$_sl_mnt" 2>/dev/null
     {
-        _sl_log "hook start (uptime $(_sl_up))"
+        _sl_start="$(_sl_up)"
+        _sl_rb="$(getarg surfacelog_reboot 0 2>/dev/null)"
+        case "$_sl_rb" in ''|*[!0-9]*) _sl_rb=0 ;; esac
+        _sl_log "hook start (uptime $_sl_start)"
         _sl_prepare_rt
         _sl_write_loop
+        _sl_pstore
         _sl_find_dev
         _sl_mount
         _sl_start_loop
