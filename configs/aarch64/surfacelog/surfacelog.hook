@@ -5,7 +5,6 @@
 
 _sl_rt=/run/surfacelog-rt
 _sl_mnt=/run/surfacelog
-_sl_label=ARCHISO_EFI
 
 _sl_log() {
     echo "surfacelog: $*" >/dev/kmsg 2>/dev/null
@@ -63,10 +62,16 @@ _sl_prepare_rt() {
 _sl_write_loop() {
     cat >"$_sl_rt/loop.sh" <<'EOF'
 #!/usr/bin/ash
-# surfacelog loop: loop.sh once|loop|show [DEV HOW START REBOOT]; cwd fixed, relative paths only
-mode="$1" dev="$2" found="$3" start="${4:-0}" rb="${5:-0}"
+# surfacelog loop: loop.sh loop|show [DEV START REBOOT WDT]; cwd fixed, relative paths only
+mode="$1" dev="$2" start="${3:-0}" rb="${4:-0}" wdt="${5:-0}"
 cd /run/surfacelog-rt || exit 0
-ROOT=../.. MNT=../surfacelog NULL=./null LOGD='' round=0 d='' how=''
+ROOT=../.. MNT=../surfacelog NULL=./null LOGD='' round=0 d='' how='' found=''
+# watchdog first: opening arms it; a failed exec-redirect would kill the shell, so probe in a subshell
+if [ "$wdt" = 1 ] && [ -w "$ROOT/dev/watchdog" ] && ( exec 8>"$ROOT/dev/watchdog" ) 2>"$NULL"; then
+    exec 8>"$ROOT/dev/watchdog"
+else
+    wdt=0
+fi
 if [ -x ./ld.so ] && [ -x ./busybox ]; then
     bb() { ./ld.so --library-path ./lib ./busybox "$@"; }
     do_mount() { ./ld.so --library-path ./lib ./mount "$@"; }
@@ -81,6 +86,7 @@ log() {
     printf 'loop: %s\n' "$*" >&2
     printf 'surfacelog: %s\n' "$*" >&9 2>"$NULL"
 }
+[ "$wdt" = 1 ] && log "watchdog armed (30 s), feeding every 3 s"
 [ -p ./sleep.fifo ] || bb mkfifo ./sleep.fifo 2>"$NULL"
 [ -p ./sleep.fifo ] && exec 3<>./sleep.fifo
 nap() {
@@ -151,13 +157,14 @@ setup_dir() {
 do_round() {
     local up='' rest p1=''
     round=$((round + 1))
+    [ "$wdt" = 1 ] && printf . >&8 2>"$NULL"
     read -r up rest 2>"$NULL" <"$ROOT/proc/uptime" || up='?'
     read -r p1 2>"$NULL" <"$ROOT/proc/1/comm" || p1='?'
     setup_dir || { try_mount && setup_dir; }
     if [ -z "$LOGD" ]; then
         if [ "$rb" -gt 0 ] && [ "${up%.*}" -ge $((start + rb - 3)) ] 2>"$NULL"; then
             log "no log device after $rb s, rebooting to preserve ramoops"
-            bb sync 2>"$NULL"; nap 3; rb=0
+            bb sync 2>"$NULL"; nap 3; rb=0 wdt=0
             echo 1 >"$ROOT/proc/sys/kernel/sysrq"
             echo b >"$ROOT/proc/sysrq-trigger"
         fi
@@ -197,7 +204,6 @@ show() {
     done
 }
 case "$mode" in
-    once) do_round ;;
     show) show ;;
     loop)
         trap '' HUP PIPE
@@ -232,63 +238,11 @@ _sl_pstore() {
     return 0
 }
 
-# poll for the label; loop.sh does the fallback searches (bootmnt device, sd?2)
-_sl_find_dev() {
-    local i=0 max d wait o
-    _sl_dev='' _sl_found=''
-    if mountpoint -q "$_sl_mnt" 2>/dev/null; then
-        _sl_found="$_sl_mnt was already mounted"
-        return 0
-    fi
-    wait="$(getarg surfacelog_wait 25 2>/dev/null)"
-    case "$wait" in ''|*[!0-9]*) wait=25 ;; esac
-    [ "$_sl_rb" -gt 0 ] && [ "$_sl_rb" -lt "$wait" ] && wait=$_sl_rb
-    max=$((wait * 2))
-    o="$(getarg surfacelog_dev 2>/dev/null)"
-    if [ -b "$o" ]; then
-        _sl_dev="$o" _sl_found="surfacelog_dev=$o"
-        return 0
-    fi
-    while [ "$i" -lt "$max" ]; do
-        if [ -b "/dev/disk/by-label/$_sl_label" ]; then
-            d="$(readlink -f "/dev/disk/by-label/$_sl_label" 2>/dev/null)"
-            [ -b "$d" ] || d="/dev/disk/by-label/$_sl_label"
-            _sl_dev="$d" _sl_found="/dev/disk/by-label/$_sl_label -> $d after $((i / 2)) s"
-            _sl_log "found $_sl_found"
-            return 0
-        fi
-        if [ $((i % 10)) -eq 9 ]; then
-            d="$(blkid -lt "LABEL=$_sl_label" -o device 2>&1)"
-            _sl_log "search $((i / 2 + 1)) s: by-label has: $(echo $(ls /dev/disk/by-label 2>&1)); blkid -lt LABEL=$_sl_label: ${d:-nothing}; sd?2: $(echo /dev/sd?2)"
-            if [ -b "$d" ]; then
-                _sl_dev="$d" _sl_found="blkid -> $d after $((i / 2)) s (no by-label symlink)"
-                return 0
-            fi
-        fi
-        sleep 0.5 2>/dev/null || sleep 1
-        i=$((i + 1))
-    done
-    _sl_log "no by-label/blkid match after $wait s; trying bootmnt/sd?2 fallbacks and retrying every 3 s"
-    return 1
-}
-
-_sl_mount() {
-    local err rc
-    mountpoint -q "$_sl_mnt" 2>/dev/null && return 0
-    modprobe -qab vfat nls_cp437 nls_ascii nls_utf8 2>/dev/null
-    _sl_log "vfat in /proc/filesystems: $(grep -c vfat /proc/filesystems 2>/dev/null)"
-    [ -n "$_sl_dev" ] || return 1
-    err="$(mount -t vfat -o rw,noatime,flush "$_sl_dev" "$_sl_mnt" 2>&1)"; rc=$?
-    _sl_log "mount -t vfat -o rw,noatime,flush $_sl_dev $_sl_mnt -> rc=$rc $err"
-    [ "$rc" -eq 0 ] && return 0
-    _sl_log "mount failed; loop will keep retrying"
-    return 1
-}
-
 _sl_start_loop() {
-    local pid=''
-    set -- "$_sl_rt/loop.sh" loop "$_sl_dev" "$_sl_found" "${_sl_start%.*}" "$_sl_rb"
-    ash "$1" once "$3" "$4" "$5" "$6" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1
+    local pid='' o
+    o="$(getarg surfacelog_dev 2>/dev/null)"
+    [ -b "$o" ] || o=''
+    set -- "$_sl_rt/loop.sh" loop "$o" "${_sl_start%.*}" "$_sl_rb" "$_sl_wdt"
     if command -v setsid >/dev/null 2>&1; then
         setsid ash "$@" </dev/null >>"$_sl_rt/surfacelog.log" 2>&1 &
     else
@@ -296,7 +250,21 @@ _sl_start_loop() {
     fi
     pid=$!
     printf '%s\n' "$pid" >"$_sl_rt/loop.pid" 2>/dev/null
-    _sl_log "background loop pid $pid, log dir '$(_sl_dir)', reboot-if-unmounted after ${_sl_rb}s (uptime $(_sl_up))"
+    _sl_log "background loop pid $pid started (uptime $(_sl_up)); dev '$o', reboot-if-unmounted ${_sl_rb}s, wdt $_sl_wdt"
+    return 0
+}
+
+# foreground: give the loop up to surfacelog_wait s (default 25, capped by surfacelog_reboot) to mount
+_sl_wait() {
+    local i=0 w
+    w="$(getarg surfacelog_wait 25 2>/dev/null)"
+    case "$w" in ''|*[!0-9]*) w=25 ;; esac
+    [ "$_sl_rb" -gt 0 ] && [ "$_sl_rb" -lt "$w" ] && w=$_sl_rb
+    while [ "$i" -lt $((w * 2)) ] && [ ! -f "$_sl_rt/bootnum" ]; do
+        sleep 0.5 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    _sl_log "foreground wait ended after $((i / 2)) s, log dir '$(_sl_dir)'"
     return 0
 }
 
@@ -318,13 +286,16 @@ run_hook() {
         _sl_start="$(_sl_up)"
         _sl_rb="$(getarg surfacelog_reboot 0 2>/dev/null)"
         case "$_sl_rb" in ''|*[!0-9]*) _sl_rb=0 ;; esac
-        _sl_log "hook start (uptime $_sl_start)"
+        _sl_wdt="$(getarg surfacelog_wdt 0 2>/dev/null)"
+        _sl_log "hook start (uptime $_sl_start); /run/udev $([ -d /run/udev ] && echo exists || echo absent); /dev/watchdog $([ -c /dev/watchdog ] && echo present || echo absent)"
+        [ "$_sl_wdt" = 1 ] && [ ! -c /dev/watchdog ] && _sl_log "no /dev/watchdog"
         _sl_prepare_rt
         _sl_write_loop
         _sl_pstore
-        _sl_find_dev
-        _sl_mount
         _sl_start_loop
+        modprobe -qab vfat nls_cp437 nls_ascii nls_utf8 2>/dev/null
+        _sl_log "vfat in /proc/filesystems: $(grep -c vfat /proc/filesystems 2>/dev/null)"
+        _sl_wait
     } 2>>"$_sl_rt/surfacelog.log" || :
     return 0
 }

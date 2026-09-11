@@ -10,8 +10,10 @@ debugged by pulling the stick afterwards.
 
 Files:
 
-- `rootfs/config` — original `config` with `surfacelog` inserted after `udev` in
-  `HOOKS`, first in `LATEHOOKS`, first in `EMERGENCYHOOKS`.
+- `rootfs/config` — original `config` with `surfacelog` inserted **before**
+  `udev` in `HOOKS` (so it runs before udev's coldplug, where the USB probe is
+  suspected to hang; `/dev` is devtmpfs so nothing there depends on udev),
+  first in `LATEHOOKS`, first in `EMERGENCYHOOKS`.
 - `rootfs/hooks/surfacelog` — the ash hook (run_hook / run_latehook / run_emergencyhook).
 - `surfacelog.cpio` — `find . -mindepth 1 | cpio -o -H newc -R 0:0` of `rootfs/`.
 - `_test/sim.sh` — user-namespace simulation of init → hook → real util-linux
@@ -39,6 +41,21 @@ partition. Useful additions to the `linux` line:
 - `surfacelog_wait=N` (default 25 s to wait for the partition),
   `surfacelog_dev=/dev/sdX2` (override the device; a plain device path),
   `disablehooks=surfacelog` (turn the hook off without touching the cpio).
+- `surfacelog_wdt=1`: the background loop opens `/dev/watchdog` on a
+  persistent fd as its very first action (opening arms the qcom-wdt, 30 s) and
+  writes one byte (never `V`, so it is never disarmed) every 3 s round. A
+  kernel hang stops the feeding and the hardware resets the board, keeping the
+  ramoops console log. Logs `surfacelog: watchdog armed (30 s), feeding every
+  3 s`, or `surfacelog: no /dev/watchdog`. When `surfacelog_reboot` fires,
+  feeding stops before the sysrq write (so even a failed sysrq ends in a
+  watchdog reset).
+- The first kmsg line of the hook is
+  `surfacelog: hook start (uptime U); /run/udev exists|absent; /dev/watchdog present|absent`
+  so a ramoops dump shows whether the hook ran before udev's coldplug.
+- The background loop (device search, mount, logging, watchdog, reboot timer)
+  starts right after the runtime copies are made; the foreground only waits up
+  to `surfacelog_wait` s (default 25, capped by `surfacelog_reboot`) for the
+  loop to mount the partition before letting init continue to udev.
 - `surfacelog_reboot=N` (default 0 = off): if the log partition is still not
   mounted N seconds after the hook started, the loop logs
   `surfacelog: no log device after N s, rebooting to preserve ramoops`, runs
