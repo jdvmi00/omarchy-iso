@@ -10,7 +10,7 @@ Use a native ARM64 Spark with Docker, Git and the builder prerequisites.
 The current workstation is x86_64; running the ARM build there additionally
 requires configured ARM emulation. Prefer the native Spark used for our earlier build.
 
-Check out this branch from Jim’s fork, with sibling `omarchy` and
+Check out this branch from Jim’s fork, with sibling `spark-omarchy` and
 `omarchy-pkgs` source checkouts. Historical inputs from the previous image assembly (that image later failed installation; see the warning below):
 
 - `jdvmi00/omarchy`: `b31c78dfed296d63aac3e78558ee902585d051a4`
@@ -41,7 +41,7 @@ From the ISO checkout, after correcting and validating those package inputs:
 git submodule update --init
 ./test/all
 ./bin/omarchy-iso-make --arch aarch64 --keep-pkg-cache --no-boot-offer \
-  --local-source ../omarchy ../omarchy-pkgs
+  --local-source ../spark-omarchy ../omarchy-pkgs
 ```
 
 The wrapper uses a privileged container and shares the host package cache.
