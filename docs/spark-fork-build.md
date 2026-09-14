@@ -11,14 +11,31 @@ The current workstation is x86_64; running the ARM build there additionally
 requires configured ARM emulation. Prefer the native Spark used for our earlier build.
 
 Check out this branch from Jim’s fork, with sibling `omarchy` and
-`omarchy-pkgs` source checkouts. Known inputs from the previous successful build:
+`omarchy-pkgs` source checkouts. Historical inputs from the previous image assembly (that image later failed installation; see the warning below):
 
 - `jdvmi00/omarchy`: `b31c78dfed296d63aac3e78558ee902585d051a4`
   (includes the ARM NVIDIA package-selection fix).
 - `omacom/omarchy-pkgs`: `2b15c13e86303cfcc9a8f94974bbaaa802270029`.
 - archiso submodule: `424e78130db2af6c1ceb55b442d7914b1109ff2b`.
 
-From the ISO checkout:
+## Spark package compatibility
+
+The historical package pin above cannot be used unchanged: the September 8
+hardware test failed with `Limine template default.conf not found`. Its ARM
+settings recipe strips boot files needed by this installer and the runtime
+recipe omits the Limine dependency stack.
+
+Our local `omarchy-pkgs` branch `spark/limine-build-compat` at
+`dd659656bc53b42aee337904b31f946a354e7dd6` retains those files and dependencies
+for ARM UEFI builds. This is a fork-specific development variant, not an Apple
+Silicon package. The real settings package functions pass boot-payload checks
+for both aarch64 and x86_64 against the pinned runtime. The package branch has
+not been published; use the local checkout or its recorded source archive.
+
+Inspect the actual offline package payload and dependency metadata after every
+build. Passing source tests and assembling an image do not prove installation.
+
+From the ISO checkout, after correcting and validating those package inputs:
 
 ```bash
 git submodule update --init
