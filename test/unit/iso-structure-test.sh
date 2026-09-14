@@ -56,7 +56,8 @@ esac
 listing=$(bsdtar -tf "$iso" 2>/dev/null) || fail "cannot read $iso as an archive"
 
 has() {
-  printf '%s\n' "$listing" | grep -qxF "$1"
+  # A here-string avoids SIGPIPE from grep -q under pipefail on large inputs.
+  grep -qxF "$1" <<<"$listing"
 }
 
 # --- the ISO is bootable at all -------------------------------------------
@@ -136,11 +137,11 @@ limine_hook=$(bsdtar -xOf "$work/limine-mkinitcpio-hook.pkg.tar" \
   usr/share/libalpm/scripts/limine-mkinitcpio-install 2>/dev/null) ||
   fail "$arch: Limine mkinitcpio hook missing from offline package"
 
-if printf '%s\n' "$limine_hook" | grep -qF 'kernel_dir}/modules.builtin'; then
-  printf '%s\n' "$installer_impl" | grep -qF 'modules_builtin_marker' ||
+if grep -qF 'kernel_dir}/modules.builtin' <<<"$limine_hook"; then
+  grep -qF 'modules_builtin_marker' <<<"$installer_impl" ||
     fail "$arch: installer does not recognize the embedded Limine modules.builtin hook"
-elif printf '%s\n' "$limine_hook" | grep -qF 'pacman -Qqo "$pkgbase_file"'; then
-  printf '%s\n' "$installer_impl" | grep -qF 'pkgbase_file' ||
+elif grep -qF 'pacman -Qqo "$pkgbase_file"' <<<"$limine_hook"; then
+  grep -qF 'pkgbase_file' <<<"$installer_impl" ||
     fail "$arch: installer does not recognize the embedded Limine pkgbase hook"
 else
   fail "$arch: embedded Limine kernel discovery mechanism is unknown"
@@ -204,7 +205,7 @@ if [[ $arch == aarch64 ]]; then
   # power-domain drivers gate the panel and the USB/PCIe links before their
   # consumers bind, and the machine has no serial port to report it on.
   for required in rd.udev.event_timeout=5 clk_ignore_unused pd_ignore_unused efi=noruntime console=tty0; do
-    printf '%s\n' "$grub_cfg" | grep -qF -- "$required" ||
+    grep -qF -- "$required" <<<"$grub_cfg" ||
       fail "aarch64: grub.cfg names no '$required'; the Snapdragon entry would not boot"
   done
   pass "aarch64: Snapdragon kernel arguments present"

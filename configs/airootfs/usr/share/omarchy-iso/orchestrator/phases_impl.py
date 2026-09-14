@@ -36,6 +36,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import archinstall_adapter as arch
+from . import surface_laptop8
 from .command import capture, capture_identifier, require_text
 from .context import InstallContext, efi_binary_name, efi_source_name
 from .keyboard import configure_keyboard
@@ -67,6 +68,16 @@ def _current_aarch64_platform() -> dict | None:
             if selector and all(dmi.get(key) == value for key, value in selector.items()):
                 return candidate
     return None
+
+
+def _is_surface_laptop8() -> bool:
+    matched = _current_aarch64_platform()
+    return bool(matched and matched["id"] == "microsoft-surface-laptop8")
+
+
+def _platform_efi_fallback() -> bool:
+    matched = _current_aarch64_platform()
+    return bool(matched and matched["boot"].get("efi_fallback"))
 
 
 def _aarch64_platform_packages() -> list[str]:
@@ -215,6 +226,9 @@ def _early_packages() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_live(ctx: InstallContext) -> None:
+    if _is_surface_laptop8() and ctx.defer_provisioning:
+        raise RuntimeError("Surface bring-up requires creating the user during installation")
+
     if ctx.is_protected:
         info("› protected mode: skipping whole-disk cleanup")
     else:
@@ -409,7 +423,8 @@ def _install_limine_omarchy(ctx: InstallContext, installer, config) -> None:
             esp_mount=str(efi_partition.mountpoint),
             disk=arch.parent_device_path(efi_partition.safe_dev_path),
             part=int(efi_partition.partn),
-            removable=bootloader_removable,
+            removable=bootloader_removable or _platform_efi_fallback(),
+            register_entry=not _platform_efi_fallback(),
         )
     else:
         _install_limine_bios(ctx, boot_partition)
@@ -424,7 +439,8 @@ def _install_pre_mounted_limine(ctx: InstallContext) -> None:
     if not esp_device:
         raise RuntimeError("omarchy_install.storage.esp_device missing")
 
-    pre_state = _read_efibootmgr()
+    fallback = _platform_efi_fallback()
+    pre_state = {"entries": {}, "order": []} if fallback else _read_efibootmgr()
     windows_before = _find_label_entries(pre_state["entries"], "Windows")
     disk, part = _split_partition_device(esp_device)
     _install_limine_efi(
@@ -435,7 +451,12 @@ def _install_pre_mounted_limine(ctx: InstallContext) -> None:
         esp_path=boot.get("esp_path", "/EFI/limine"),
         efi_binary=boot.get("efi_binary", efi_binary_name()),
         pre_state=pre_state,
+        removable=fallback,
+        register_entry=not fallback,
     )
+
+    if fallback:
+        return
 
     post_state = _read_efibootmgr()
     windows_after = _find_label_entries(post_state["entries"], "Windows")
@@ -453,6 +474,7 @@ def _install_limine_efi(
     esp_path: str = "/EFI/limine",
     efi_binary: str | None = None,
     pre_state: dict | None = None,
+    register_entry: bool = True,
 ) -> None:
     if removable:
         esp_path = "/EFI/BOOT"
@@ -468,6 +490,10 @@ def _install_limine_efi(
 
     hook_command = f"/usr/bin/cp /usr/share/limine/{source_name} {target_path}"
     _write_limine_pacman_hook(ctx.target, hook_command)
+
+    if not register_entry:
+        info(f"› installed EFI fallback loader at {target_path}; no NVRAM registration")
+        return
 
     loader = "\\" + str(Path(esp_path) / efi_binary).strip("/").replace("/", "\\")
     _register_limine_efi_entry(disk, part, loader, pre_state=pre_state)
@@ -610,6 +636,9 @@ def _write_limine_defaults(
     default_text = re.sub(r'^ESP_PATH=.*$', f'ESP_PATH="{esp_mount}"', default_text, flags=re.MULTILINE)
     if enable_fallback is not None:
         default_text = default_text.rstrip() + f"\nENABLE_LIMINE_FALLBACK={'yes' if enable_fallback else 'no'}\n"
+    matched = _current_aarch64_platform()
+    if matched and "uki" in matched["boot"]:
+        enable_uki = matched["boot"]["uki"]
     if enable_uki is not None:
         # /etc/default/limine has higher priority than Omarchy's installed
         # /etc/limine-entry-tool.d/omarchy-uki.conf. Without this override an
@@ -849,6 +878,9 @@ def _boot_intent(ctx: InstallContext) -> dict:
     boot.setdefault("esp_path", "/EFI/limine")
     boot.setdefault("efi_binary", efi_binary_name())
     boot.setdefault("enable_fallback", not ctx.is_protected)
+    if _platform_efi_fallback():
+        boot["esp_path"] = "/EFI/BOOT"
+        boot["efi_binary"] = efi_source_name()
     return boot
 
 
@@ -1033,6 +1065,10 @@ def configure_hibernation(ctx: InstallContext) -> None:
     Limine UKI build still happens later in finalize_limine_boot after this
     writes the resume hook and kernel cmdline drop-in.
     """
+    if _is_surface_laptop8():
+        info("› Surface bring-up: hibernation is not yet validated")
+        return
+
     setup = ctx.target / "usr" / "bin" / "omarchy-hibernation-setup"
     if not setup.exists():
         _debug_log(ctx, "skipping hibernation: /usr/bin/omarchy-hibernation-setup is not installed")
@@ -1247,6 +1283,8 @@ def run_system_finalizer(ctx: InstallContext) -> None:
         _run_target_setup_command(ctx, cmd)
     finally:
         _unmask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
+    if _is_surface_laptop8():
+        surface_laptop8.configure_system(ctx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1786,6 +1824,10 @@ def _read_omarchy_mirror() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def configure_login(ctx: InstallContext) -> None:
+    if _is_surface_laptop8():
+        surface_laptop8.configure_user(ctx)
+        return
+
     sddm_dir = ctx.target / "etc" / "sddm.conf.d"
     sddm_dir.mkdir(parents=True, exist_ok=True)
     (sddm_dir / "99-omarchy-login.conf").write_text(
@@ -2081,9 +2123,10 @@ def validate_boot(ctx: InstallContext) -> None:
                     f"no complete Limine kernel/initramfs entry under {esp_mount / machine_id}"
                 )
 
-        post = _read_efibootmgr()
-        if not _find_label_entries(post["entries"], "Limine"):
-            raise RuntimeError("no 'Limine' entry registered in efibootmgr")
+        if not _platform_efi_fallback():
+            post = _read_efibootmgr()
+            if not _find_label_entries(post["entries"], "Limine"):
+                raise RuntimeError("no 'Limine' entry registered in efibootmgr")
 
     if ctx.is_protected:
         _validate_pre_mounted_filesystems(ctx)

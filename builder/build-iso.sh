@@ -94,6 +94,7 @@ if [[ -n ${OMARCHY_EXTRA_PKGBUILDS:-} ]]; then
   build_tools+=(rust)
 fi
 pacman --noconfirm -Syu "${build_tools[@]}"
+grub-script-check /configs/grub/grub.cfg
 
 # Pre-import the omarchy signing key (so pacman trusts our [omarchy] repo
 # during the build without keyserver lookups).
@@ -215,6 +216,23 @@ if [[ $OMARCHY_ARCH == "aarch64" ]]; then
   # "binary not found: 'memdiskfind'" and "module not found: 'phram'".
   sed -i -e 's/ microcode / /' -e 's/ memdisk / /' \
     "$build_cache_dir/airootfs/etc/mkinitcpio.conf.d/archiso.conf"
+
+  # A board-specific image must carry the same early drivers/firmware as its
+  # installed system. Opt in explicitly; other ARM builds keep their profile.
+  if [[ -n ${OMARCHY_AARCH64_PLATFORM:-} ]]; then
+    platform=/configs/aarch64/platforms.json
+    jq -e --arg id "$OMARCHY_AARCH64_PLATFORM" \
+      '.platforms[] | select(.id == $id)' "$platform" >/dev/null
+    {
+      printf 'MODULES+=('
+      jq -r --arg id "$OMARCHY_AARCH64_PLATFORM" \
+        '.platforms[] | select(.id == $id) | .initramfs.modules[]? | @sh' "$platform"
+      printf ')\nFILES+=('
+      jq -r --arg id "$OMARCHY_AARCH64_PLATFORM" \
+        '.platforms[] | select(.id == $id) | .initramfs.files[]? | @sh' "$platform"
+      printf ')\n'
+    } >> "$build_cache_dir/airootfs/etc/mkinitcpio.conf.d/archiso.conf"
+  fi
 
   # archiso globs ${pacstrap_dir}/boot/vmlinuz-* for both the ISO 9660 tree and
   # the FAT EFI image, but Arch Linux ARM installs its kernel as /boot/Image --

@@ -120,17 +120,70 @@
         "hardware_description": "dtb-override",
         "dtb": "qcom/glymur-microsoft-surface-laptop8.dtb",
         "kernel_cmdline": [
+          "initramfs_async=0",
+          "rd.udev.event_timeout=5",
+          "clk_ignore_unused",
+          "pd_ignore_unused",
+          "cma=128M",
+          "efi=noruntime",
           "console=tty0",
-          "plymouth.ignore-serial-consoles"
-        ]
+          "earlycon=efifb",
+          "keep_bootcon",
+          "loglevel=3",
+          "panic=0",
+          "plymouth.ignore-serial-consoles",
+          "regulator_ignore_unused",
+          "rd.log=kmsg",
+          "log_buf_len=8M",
+          "drm.debug=0",
+          "msm.edp_force_max_link_rate=1",
+          "consoleblank=0"
+        ],
+        "efi_fallback": true,
+        "uki": false
       },
       "kernel": {
         "package": "linux-aarch64",
         "availability": "iso"
       },
       "packages": [
-        "linux-firmware"
-      ]
+        "linux-firmware-qcom",
+        "omarchy-surface-laptop8-bringup",
+        "snapper",
+        "limine-mkinitcpio-hook",
+        "limine-snapper-sync",
+        "foot",
+        "qt6-multimedia",
+        "qt6-imageformats",
+        "inotify-tools",
+        "xdg-terminal-exec"
+      ],
+      "initramfs": {
+        "modules": [
+          "gpucc_glymur",
+          "camcc_glymur",
+          "videocc_glymur",
+          "evacc_glymur",
+          "gxclkctl_kaanapali",
+          "phy_qcom_edp",
+          "panel_edp",
+          "msm",
+          "surface_aggregator",
+          "surface_aggregator_registry",
+          "surface_aggregator_hub",
+          "surface_hid_core",
+          "surface_hid",
+          "surface_kbd",
+          "i2c_hid_of",
+          "hid_multitouch",
+          "nvme",
+          "r8152"
+        ],
+        "files": [
+          "/usr/lib/firmware/qcom/gen80100_sqe.fw",
+          "/usr/lib/firmware/qcom/gen80100_gmu.bin"
+        ]
+      }
     }
   ]
 }
