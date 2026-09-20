@@ -23,7 +23,9 @@
         "linux-firmware-nvidia",
         "nvidia-open-dkms",
         "nvidia-utils",
-        "nvidia-container-toolkit"
+        "nvidia-container-toolkit",
+        "nsight-compute",
+        "nsight-systems"
       ],
       "kernel_cmdline": ["console=tty0", "plymouth.ignore-serial-consoles"]
     },
