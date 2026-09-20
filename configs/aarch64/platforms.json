@@ -23,7 +23,9 @@
         "linux-firmware-nvidia",
         "nvidia-open-dkms",
         "nvidia-utils",
-        "nvidia-container-toolkit"
+        "nvidia-container-toolkit",
+        "nvidia-ai-workbench",
+        "dgx-dashboard"
       ],
       "kernel_cmdline": ["console=tty0", "plymouth.ignore-serial-consoles"]
     },
