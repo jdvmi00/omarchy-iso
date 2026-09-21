@@ -23,7 +23,8 @@
         "linux-firmware-nvidia",
         "nvidia-open-dkms",
         "nvidia-utils",
-        "nvidia-container-toolkit"
+        "nvidia-container-toolkit",
+        "rdma-core"
       ],
       "kernel_cmdline": ["console=tty0", "plymouth.ignore-serial-consoles"]
     },
