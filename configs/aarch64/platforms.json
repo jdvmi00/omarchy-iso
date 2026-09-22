@@ -25,7 +25,10 @@
         "nvidia-utils",
         "nvidia-container-toolkit",
         "nvidia-ai-workbench",
-        "dgx-dashboard"
+        "dgx-dashboard",
+        "nsight-compute",
+        "nsight-systems",
+        "rdma-core"
       ],
       "kernel_cmdline": ["console=tty0", "plymouth.ignore-serial-consoles"]
     },
